@@ -1,0 +1,123 @@
+# Ceph dev cluster — Docker Compose (Quincy / v17)
+#
+# Services:
+#   ceph-mon  — Monitor  (quorum, cluster maps)
+#   ceph-mgr  — Manager  (dashboard, Prometheus)
+#   ceph-osd  — 3 OSDs   (bootstrapped by osd-entrypoint.sh)
+#   ceph-rgw  — RADOS Gateway  (S3 / Swift on :7480)
+#
+# Compose files live on D:\ceph (Windows-accessible).
+# Data lives on the Linux ext4 filesystem (WSL2) — required by Ceph:
+#   ~/ceph-data/etc/  →  /etc/ceph        (ceph.conf, keyrings)
+#   ~/ceph-data/lib/  →  /var/lib/ceph    (mon data, bootstrap keyrings)
+#   ~/ceph-data/osd/  →  /var/lib/ceph/osd (OSD bluestore directories)
+#
+# Browse data from Windows: \\wsl$\Ubuntu\home\marco\ceph-data\
+#
+# For production use cephadm or Rook-Ceph instead.
+
+networks:
+  ceph-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.10.0/24
+
+services:
+
+  # ── Monitor ────────────────────────────────────────────────────────────────
+  ceph-mon:
+    image: quay.io/ceph/daemon:latest-quincy
+    container_name: ceph-mon
+    hostname: ceph-mon
+    restart: unless-stopped
+    environment:
+      CEPH_DAEMON: MON
+      MON_IP: 192.168.10.10
+      CEPH_PUBLIC_NETWORK: 192.168.10.0/24
+    networks:
+      ceph-net:
+        ipv4_address: 192.168.10.10
+    volumes:
+      - /home/marco/ceph-data/etc:/etc/ceph
+      - /home/marco/ceph-data/lib:/var/lib/ceph
+    healthcheck:
+      test: ["CMD", "ceph", "health"]
+      interval: 10s
+      timeout: 8s
+      retries: 20
+      start_period: 45s
+
+  # ── Manager (Dashboard + Prometheus) ──────────────────────────────────────
+  ceph-mgr:
+    image: quay.io/ceph/daemon:latest-quincy
+    container_name: ceph-mgr
+    hostname: ceph-mgr
+    restart: unless-stopped
+    environment:
+      CEPH_DAEMON: MGR
+      MON_IP: 192.168.10.10
+      CEPH_PUBLIC_NETWORK: 192.168.10.0/24
+    networks:
+      ceph-net:
+        ipv4_address: 192.168.10.11
+    volumes:
+      - /home/marco/ceph-data/etc:/etc/ceph
+      - /home/marco/ceph-data/lib:/var/lib/ceph
+    ports:
+      - "8443:8443"   # Ceph Dashboard (HTTPS)
+      - "9283:9283"   # Prometheus metrics
+    depends_on:
+      ceph-mon:
+        condition: service_healthy
+
+  # ── OSDs (3 bluestore OSDs, directory-based) ──────────────────────────────
+  # osd-entrypoint.sh bootstraps each OSD directory on first boot,
+  # then runs all ceph-osd processes in the foreground.
+  ceph-osd:
+    image: quay.io/ceph/daemon:latest-quincy
+    container_name: ceph-osd
+    hostname: ceph-osd
+    restart: unless-stopped
+    privileged: true
+    entrypoint: ["/bin/bash", "/entrypoint-osd.sh"]
+    environment:
+      CLUSTER: ceph
+      OSD_COUNT: "3"
+      MON_IP: 192.168.10.10
+      CEPH_PUBLIC_NETWORK: 192.168.10.0/24
+    networks:
+      ceph-net:
+        ipv4_address: 192.168.10.21
+    volumes:
+      - /home/marco/ceph-data/etc:/etc/ceph
+      - /home/marco/ceph-data/lib:/var/lib/ceph
+      - /home/marco/ceph-data/osd:/var/lib/ceph/osd
+      - /mnt/d/ceph/osd-entrypoint.sh:/entrypoint-osd.sh:ro
+    depends_on:
+      ceph-mon:
+        condition: service_healthy
+
+  # ── RADOS Gateway — S3 / Swift endpoint ───────────────────────────────────
+  ceph-rgw:
+    image: quay.io/ceph/daemon:latest-quincy
+    container_name: ceph-rgw
+    hostname: ceph-rgw
+    restart: unless-stopped
+    environment:
+      CEPH_DAEMON: RGW
+      MON_IP: 192.168.10.10
+      CEPH_PUBLIC_NETWORK: 192.168.10.0/24
+      RGW_NAME: rgw1
+      RGW_CIVETWEB_PORT: 7480
+    networks:
+      ceph-net:
+        ipv4_address: 192.168.10.30
+    volumes:
+      - /home/marco/ceph-data/etc:/etc/ceph
+      - /home/marco/ceph-data/lib:/var/lib/ceph
+    ports:
+      - "7480:7480"   # S3-compatible endpoint
+    depends_on:
+      ceph-osd:
+        condition: service_started

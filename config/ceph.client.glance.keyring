@@ -1,0 +1,4 @@
+[client.glance]
+	key = AQBoUAxq65DNNBAAcYdn9cdHh8dXJa+UABS6ig==
+	caps mon = "allow r"
+	caps osd = "allow class-read object_prefix rbd_children, allow rwx pool=images"

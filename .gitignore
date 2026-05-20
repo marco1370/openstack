@@ -1,0 +1,8 @@
+# Ceph authentication keyrings (credentials)
+config/*.keyring
+
+# Keystone fernet / credential keys
+data/keystone/fernet-keys/
+
+# VM images (large binaries)
+images/

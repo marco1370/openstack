@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/d/openstack/**)",
+      "Bash(docker compose *)"
+    ]
+  }
+}

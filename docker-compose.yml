@@ -1,0 +1,509 @@
+# OpenStack (Bobcat / 2023.2) + Ceph integration
+#
+# Services:
+#   mariadb       — MySQL-compatible database backend
+#   rabbitmq      — AMQP message broker
+#   memcached     — Token/auth caching
+#   keystone      — Identity (auth, service catalog)
+#   glance        — Image service  → Ceph RBD pool: images
+#   cinder-api    — Block storage API
+#   cinder-volume — Block storage backend → Ceph RBD pool: volumes
+#   horizon       — Web dashboard
+#
+# Ceph integration:
+#   Ceph config + keyrings are bind-mounted from ./config/
+#   OpenStack containers join ceph_ceph-net to reach the MON at 192.168.10.10
+#
+# Credentials:
+#   Admin:    OS_USERNAME=admin  OS_PASSWORD=adminpass
+#   Horizon:  http://localhost:8080  (admin / adminpass)
+#   Keystone: http://localhost:5000/v3
+
+x-ceph-volumes: &ceph-volumes
+  - ./config/ceph.conf:/etc/ceph/ceph.conf:ro
+  - ./config/ceph.client.glance.keyring:/etc/ceph/ceph.client.glance.keyring:ro
+  - ./config/ceph.client.cinder.keyring:/etc/ceph/ceph.client.cinder.keyring:ro
+  - ./config/ceph.client.cinder-backup.keyring:/etc/ceph/ceph.client.cinder-backup.keyring:ro
+
+x-openstack-env: &openstack-env
+  MYSQL_ROOT_PASSWORD: rootpass
+  KEYSTONE_DB_PASS: keystonepass
+  GLANCE_DB_PASS: glancepass
+  GLANCE_PASS: glancepass
+  CINDER_DB_PASS: cinderpass
+  CINDER_PASS: cinderpass
+  ADMIN_PASS: adminpass
+  NOVA_DB_PASS: novapass
+  NOVA_PASS: novapass
+  PLACEMENT_DB_PASS: placementpass
+  PLACEMENT_PASS: placementpass
+  NEUTRON_DB_PASS: neutronpass
+  NEUTRON_PASS: neutronpass
+
+networks:
+  openstack-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.20.0/24
+  ceph-net:
+    external: true
+    name: ceph_ceph-net
+  vm-provider-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.30.0/24
+
+volumes:
+  mariadb-data:
+  rabbitmq-data:
+  libvirt-run:
+  nova-instances:
+
+services:
+
+  # ── MariaDB ────────────────────────────────────────────────────────────────
+  mariadb:
+    image: mariadb:10.11
+    container_name: os-mariadb
+    hostname: mariadb
+    restart: unless-stopped
+    command: --max-connections=500
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.10
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── RabbitMQ ───────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: os-rabbitmq
+    hostname: rabbitmq
+    restart: unless-stopped
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.11
+    ports:
+      - "15672:15672"   # RabbitMQ management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Memcached ──────────────────────────────────────────────────────────────
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: os-memcached
+    hostname: memcached
+    restart: unless-stopped
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.12
+
+  # ── Keystone ───────────────────────────────────────────────────────────────
+  keystone:
+    image: quay.io/openstack.kolla/keystone:2023.2-ubuntu-jammy
+    container_name: os-keystone
+    hostname: keystone
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/scripts/keystone-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.20
+    ports:
+      - "5000:5000"   # Keystone identity API
+    volumes:
+      - ./config/keystone.conf:/etc/keystone/keystone.conf:ro
+      - ./data/keystone/fernet-keys:/etc/keystone/fernet-keys
+      - /home/marco/openstack-scripts/keystone-start.sh:/scripts/keystone-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/v3/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ── Glance (Image Service → Ceph RBD) ─────────────────────────────────────
+  glance:
+    image: quay.io/openstack.kolla/glance-api:2023.2-ubuntu-jammy
+    container_name: os-glance
+    hostname: glance
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/glance-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.21
+      ceph-net: {}
+    ports:
+      - "9292:9292"   # Glance image API
+    volumes:
+      - ./config/glance-api.conf:/etc/glance/glance-api.conf:ro
+      - ./config/ceph.conf:/etc/ceph/ceph.conf:ro
+      - ./config/ceph.client.glance.keyring:/etc/ceph/ceph.client.glance.keyring:ro
+      - /home/marco/openstack-scripts/glance-start.sh:/scripts/glance-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9292/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  # ── Cinder API ────────────────────────────────────────────────────────────
+  cinder-api:
+    image: quay.io/openstack.kolla/cinder-api:2023.2-ubuntu-jammy
+    container_name: os-cinder-api
+    hostname: cinder-api
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/cinder-api-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.22
+    ports:
+      - "8776:8776"   # Cinder block storage API
+    volumes:
+      - ./config/cinder.conf:/etc/cinder/cinder.conf:ro
+      - /home/marco/openstack-scripts/cinder-api-start.sh:/scripts/cinder-api-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8776/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  # ── Cinder Scheduler ──────────────────────────────────────────────────────
+  cinder-scheduler:
+    image: quay.io/openstack.kolla/cinder-scheduler:2023.2-ubuntu-jammy
+    container_name: os-cinder-scheduler
+    hostname: cinder-scheduler
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/cinder-scheduler-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.24
+    volumes:
+      - ./config/cinder.conf:/etc/cinder/cinder.conf:ro
+      - /home/marco/openstack-scripts/cinder-scheduler-start.sh:/scripts/cinder-scheduler-start.sh:ro
+    depends_on:
+      cinder-api:
+        condition: service_healthy
+
+  # ── Cinder Volume (Ceph RBD backend) ──────────────────────────────────────
+  cinder-volume:
+    image: quay.io/openstack.kolla/cinder-volume:2023.2-ubuntu-jammy
+    container_name: os-cinder-volume
+    hostname: cinder-volume
+    restart: unless-stopped
+    privileged: true
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/cinder-volume-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.23
+      ceph-net: {}
+    volumes:
+      - ./config/cinder.conf:/etc/cinder/cinder.conf:ro
+      - ./config/ceph.conf:/etc/ceph/ceph.conf:ro
+      - ./config/ceph.client.cinder.keyring:/etc/ceph/ceph.client.cinder.keyring:ro
+      - ./config/ceph.client.cinder-backup.keyring:/etc/ceph/ceph.client.cinder-backup.keyring:ro
+      - /home/marco/openstack-scripts/cinder-volume-start.sh:/scripts/cinder-volume-start.sh:ro
+    depends_on:
+      cinder-api:
+        condition: service_healthy
+
+  # ── Placement API ─────────────────────────────────────────────────────────
+  placement:
+    image: quay.io/openstack.kolla/placement-api:2023.2-ubuntu-jammy
+    container_name: os-placement
+    hostname: placement
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/placement-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.40
+    ports:
+      - "8778:8778"
+    volumes:
+      - ./config/placement.conf:/etc/placement/placement.conf:ro
+      - /home/marco/openstack-scripts/placement-start.sh:/scripts/placement-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8778"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ── Nova API + noVNC proxy ─────────────────────────────────────────────────
+  nova-api:
+    image: quay.io/openstack.kolla/nova-api:2023.2-ubuntu-jammy
+    container_name: os-nova-api
+    hostname: nova-api
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/nova-api-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.41
+    ports:
+      - "8774:8774"   # Nova compute API
+      - "8775:8775"   # Nova metadata
+      - "6080:6080"   # noVNC proxy
+    volumes:
+      - ./config/nova.conf:/etc/nova/nova.conf:ro
+      - /home/marco/openstack-scripts/nova-api-start.sh:/scripts/nova-api-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+      placement:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8774/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # ── Nova Conductor ─────────────────────────────────────────────────────────
+  nova-conductor:
+    image: quay.io/openstack.kolla/nova-conductor:2023.2-ubuntu-jammy
+    container_name: os-nova-conductor
+    hostname: nova-conductor
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/nova-conductor-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.42
+    volumes:
+      - ./config/nova.conf:/etc/nova/nova.conf:ro
+      - /home/marco/openstack-scripts/nova-conductor-start.sh:/scripts/nova-conductor-start.sh:ro
+    depends_on:
+      nova-api:
+        condition: service_healthy
+
+  # ── Nova Scheduler ─────────────────────────────────────────────────────────
+  nova-scheduler:
+    image: quay.io/openstack.kolla/nova-scheduler:2023.2-ubuntu-jammy
+    container_name: os-nova-scheduler
+    hostname: nova-scheduler
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/nova-scheduler-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.43
+    volumes:
+      - ./config/nova.conf:/etc/nova/nova.conf:ro
+      - /home/marco/openstack-scripts/nova-scheduler-start.sh:/scripts/nova-scheduler-start.sh:ro
+    depends_on:
+      nova-api:
+        condition: service_healthy
+
+  # ── Nova Libvirt (KVM daemon) ──────────────────────────────────────────────
+  nova-libvirt:
+    image: quay.io/openstack.kolla/nova-libvirt:2023.2-ubuntu-jammy
+    container_name: os-nova-libvirt
+    hostname: nova-libvirt
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    entrypoint: ["/bin/bash", "/scripts/nova-libvirt-start.sh"]
+    devices:
+      - /dev/kvm:/dev/kvm
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - libvirt-run:/run/libvirt
+      - nova-instances:/var/lib/nova/instances
+      - /lib/modules:/lib/modules:ro
+      - /home/marco/openstack-scripts/nova-libvirt-start.sh:/scripts/nova-libvirt-start.sh:ro
+
+  # ── Nova Compute (KVM) ─────────────────────────────────────────────────────
+  nova-compute:
+    image: quay.io/openstack.kolla/nova-compute:2023.2-ubuntu-jammy
+    container_name: os-nova-compute
+    hostname: nova-compute
+    restart: unless-stopped
+    privileged: true
+    user: root
+    network_mode: host
+    entrypoint: ["/bin/bash", "/scripts/nova-compute-start.sh"]
+    environment:
+      <<: *openstack-env
+    devices:
+      - /dev/kvm:/dev/kvm
+    volumes:
+      - ./config/nova.conf:/etc/nova/nova.conf:ro
+      - ./config/neutron.conf:/etc/neutron/neutron.conf:ro
+      - libvirt-run:/run/libvirt
+      - nova-instances:/var/lib/nova/instances
+      - ./config/ceph.conf:/etc/ceph/ceph.conf:ro
+      - ./config/ceph.client.cinder.keyring:/etc/ceph/ceph.client.cinder.keyring:ro
+      - /home/marco/openstack-scripts/nova-compute-start.sh:/scripts/nova-compute-start.sh:ro
+    depends_on:
+      nova-api:
+        condition: service_healthy
+      nova-libvirt:
+        condition: service_started
+
+  # ── Neutron Server ─────────────────────────────────────────────────────────
+  neutron-server:
+    image: quay.io/openstack.kolla/neutron-server:2023.2-ubuntu-jammy
+    container_name: os-neutron-server
+    hostname: neutron-server
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/neutron-server-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.50
+    ports:
+      - "9696:9696"   # Neutron network API
+    volumes:
+      - ./config/neutron.conf:/etc/neutron/neutron.conf:ro
+      - ./config/ml2_conf.ini:/etc/neutron/plugins/ml2/ml2_conf.ini:ro
+      - /home/marco/openstack-scripts/neutron-server-start.sh:/scripts/neutron-server-start.sh:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9696/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  # ── VM Provider Net Anchor (forces Docker to create 192.168.30.0/24 bridge)
+  vm-net-anchor:
+    image: busybox:latest
+    container_name: os-vm-net-anchor
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    networks:
+      vm-provider-net:
+        ipv4_address: 192.168.30.254
+
+  # ── Neutron Linuxbridge Agent ──────────────────────────────────────────────
+  neutron-linuxbridge-agent:
+    image: quay.io/openstack.kolla/neutron-linuxbridge-agent:2023.2-ubuntu-jammy
+    container_name: os-neutron-lb-agent
+    hostname: neutron-lb-agent
+    restart: unless-stopped
+    privileged: true
+    user: root
+    network_mode: host
+    entrypoint: ["/bin/bash", "/scripts/neutron-linuxbridge-agent-start.sh"]
+    environment:
+      <<: *openstack-env
+    volumes:
+      - ./config/neutron.conf:/etc/neutron/neutron.conf:ro
+      - /home/marco/openstack-scripts/neutron-linuxbridge-agent-start.sh:/scripts/neutron-linuxbridge-agent-start.sh:ro
+    depends_on:
+      neutron-server:
+        condition: service_healthy
+      vm-net-anchor:
+        condition: service_started
+
+  # ── Neutron Agents (DHCP + Metadata) ──────────────────────────────────────
+  neutron-agents:
+    image: quay.io/openstack.kolla/neutron-dhcp-agent:2023.2-ubuntu-jammy
+    container_name: os-neutron-agents
+    hostname: neutron-agents
+    restart: unless-stopped
+    privileged: true
+    user: root
+    network_mode: host
+    entrypoint: ["/bin/bash", "/scripts/neutron-agents-start.sh"]
+    environment:
+      <<: *openstack-env
+    volumes:
+      - ./config/neutron.conf:/etc/neutron/neutron.conf:ro
+      - ./config/dhcp_agent.ini:/etc/neutron/dhcp_agent.ini:ro
+      - ./config/metadata_agent.ini:/etc/neutron/metadata_agent.ini:ro
+      - /home/marco/openstack-scripts/neutron-agents-start.sh:/scripts/neutron-agents-start.sh:ro
+    depends_on:
+      neutron-server:
+        condition: service_healthy
+
+  # ── Horizon (Web Dashboard) ────────────────────────────────────────────────
+  horizon:
+    image: quay.io/openstack.kolla/horizon:2023.2-ubuntu-jammy
+    container_name: os-horizon
+    hostname: horizon
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/horizon-start.sh"]
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.30
+    ports:
+      - "8080:80"   # Horizon web UI
+    volumes:
+      - /home/marco/openstack-scripts/horizon-start.sh:/scripts/horizon-start.sh:ro
+    depends_on:
+      keystone:
+        condition: service_healthy
