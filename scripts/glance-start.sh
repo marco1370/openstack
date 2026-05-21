@@ -2,25 +2,31 @@
 set -e
 log() { echo "$(date -u +%H:%M:%S) [glance] $*"; }
 
-log "waiting for MariaDB..."
-until python3 -c "
-import pymysql, sys
+cat > /tmp/wait_db.py << 'PYEOF'
+import pymysql, sys, os
 try:
-    pymysql.connect(host='mariadb', user='root', password='${MYSQL_ROOT_PASSWORD}')
-    sys.exit(0)
-except: sys.exit(1)
-" 2>/dev/null; do sleep 2; done
+    pymysql.connect(host='mariadb', user='root', password=os.environ['MYSQL_ROOT_PASSWORD'])
+except Exception:
+    sys.exit(1)
+PYEOF
+
+cat > /tmp/init_db.py << 'PYEOF'
+import pymysql, os
+c = pymysql.connect(host='mariadb', user='root', password=os.environ['MYSQL_ROOT_PASSWORD'])
+cur = c.cursor()
+cur.execute("CREATE DATABASE IF NOT EXISTS glance")
+cur.execute("GRANT ALL ON glance.* TO 'glance'@'%%' IDENTIFIED BY '%s'" % os.environ['GLANCE_DB_PASS'])
+cur.execute("FLUSH PRIVILEGES")
+c.commit()
+print("glance database ready")
+PYEOF
+
+mkdir -p /var/log/glance
+log "waiting for MariaDB..."
+until python3 /tmp/wait_db.py; do sleep 2; done
 
 log "creating glance database..."
-python3 -c "
-import pymysql
-c = pymysql.connect(host='mariadb', user='root', password='${MYSQL_ROOT_PASSWORD}')
-cur = c.cursor()
-cur.execute(\"CREATE DATABASE IF NOT EXISTS glance\")
-cur.execute(\"GRANT ALL ON glance.* TO 'glance'@'%' IDENTIFIED BY '${GLANCE_DB_PASS}'\")
-cur.execute('FLUSH PRIVILEGES')
-c.commit()
-"
+python3 /tmp/init_db.py
 
 log "waiting for keystone..."
 until curl -sf http://keystone:5000/v3/ &>/dev/null; do sleep 3; done
@@ -32,7 +38,7 @@ export OS_USER_DOMAIN_NAME=Default OS_PROJECT_DOMAIN_NAME=Default
 export OS_IDENTITY_API_VERSION=3
 
 openstack project list | grep -q service || openstack project create --domain default service
-openstack user list | grep -q '^| glance' || \
+openstack user show glance &>/dev/null || \
   openstack user create --domain default --password "${GLANCE_PASS}" glance
 openstack role assignment list --user glance --project service | grep -q admin || \
   openstack role add --project service --user glance admin

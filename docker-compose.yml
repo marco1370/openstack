@@ -298,7 +298,6 @@ services:
     ports:
       - "8774:8774"   # Nova compute API
       - "8775:8775"   # Nova metadata
-      - "6080:6080"   # noVNC proxy
     volumes:
       - ./config/nova.conf:/etc/nova/nova.conf:ro
       - /home/marco/openstack-scripts/nova-api-start.sh:/scripts/nova-api-start.sh:ro
@@ -317,6 +316,34 @@ services:
       timeout: 5s
       retries: 20
       start_period: 120s
+
+  # ── Nova noVNC Proxy ───────────────────────────────────────────────────────
+  nova-novncproxy:
+    image: quay.io/openstack.kolla/nova-novncproxy:2023.2-ubuntu-jammy
+    container_name: os-nova-novncproxy
+    hostname: nova-novncproxy
+    restart: unless-stopped
+    user: root
+    entrypoint: ["/bin/bash", "/scripts/nova-novncproxy-start.sh"]
+    environment:
+      <<: *openstack-env
+    networks:
+      openstack-net:
+        ipv4_address: 192.168.20.45
+    ports:
+      - "6080:6080"   # noVNC proxy
+    volumes:
+      - ./config/nova.conf:/etc/nova/nova.conf:ro
+      - /home/marco/openstack-scripts/nova-novncproxy-start.sh:/scripts/nova-novncproxy-start.sh:ro
+    depends_on:
+      nova-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:6080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
 
   # ── Nova Conductor ─────────────────────────────────────────────────────────
   nova-conductor:
